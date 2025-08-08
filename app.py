@@ -124,7 +124,7 @@ def calcular_kpis(df_plan, df_real, obra):
 
     return pct_en_fecha, prom_retraso, total_estimado
 
-def plot_gantt(df_plan, df_real, obra):
+def plot_gantt(df_plan, df_real, obra, escala="Mensual (grilla semanal)"):
     df_real_obra = df_real[df_real["Obra"].astype(str).str.strip().str.upper() == obra.upper()].copy()
     for c in ["Real OBR", "Real COMPRA", "Real OCE"]:
         if c in df_real_obra.columns:
@@ -190,6 +190,30 @@ def plot_gantt(df_plan, df_real, obra):
         title=f"Plan de Compras - {obra}"
     )
     fig.update_layout(legend_title="Tipo")
+
+    # ----- eje X con opción de escala -----
+    if escala.startswith("Mensual"):
+        # Ticks mensuales, grilla menor semanal
+        fig.update_xaxes(
+            tickformat="%b %Y",
+            dtick="M1",
+            showgrid=True,
+            gridcolor="rgba(255,255,255,0.15)",
+            minor=dict(
+                dtick=7 * 24 * 60 * 60 * 1000,  # 7 días en ms
+                showgrid=True,
+                gridcolor="rgba(255,255,255,0.08)"
+            )
+        )
+    else:
+        # Ticks semanales
+        fig.update_xaxes(
+            tickformat="%d-%b\n%Y",
+            dtick=7 * 24 * 60 * 60 * 1000,
+            showgrid=True,
+            gridcolor="rgba(255,255,255,0.15)"
+        )
+
     return fig
 
 # -----------------------------
@@ -198,6 +222,7 @@ def plot_gantt(df_plan, df_real, obra):
 st.set_page_config(page_title="Plan de Compras", layout="wide")
 st.sidebar.title("Navegación")
 obra_sel = st.sidebar.radio("Selecciona la obra", ["CAPRI", "CHALETS", "SENECA"])
+escala_sel = st.sidebar.selectbox("Escala de tiempo", ["Mensual (grilla semanal)", "Semanal (ticks semanales)"])
 archivo_excel = st.sidebar.file_uploader("Subí el archivo Excel", type=["xlsx"])
 
 if not archivo_excel:
@@ -237,7 +262,7 @@ c2.metric("Días promedio de retraso", f"{prom_ret:.1f} días")
 c3.metric("Total Estimado", fmt_money(total_est))
 
 # Gantt
-fig = plot_gantt(plan_form, df_real, obra_sel)
+fig = plot_gantt(plan_form, df_real, obra_sel, escala=escala_sel)
 st.plotly_chart(fig, use_container_width=True)
 
 # Tabla opcional
