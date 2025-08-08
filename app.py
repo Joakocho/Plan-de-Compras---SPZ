@@ -1,88 +1,177 @@
 import streamlit as st
 import pandas as pd
+import numpy as np
 import plotly.express as px
-from datetime import datetime
 
-# ---------------------------------------------
-# Funciones auxiliares
-# ---------------------------------------------
+# -----------------------------
+# Utilidades
+# -----------------------------
 def clean_date(val):
-    """Convierte el valor a fecha o NaT si no es válido"""
+    """Convierte a fecha o NaT, ignorando textos tipo OK/COMPRADO/-"""
     if pd.isna(val):
         return pd.NaT
     if isinstance(val, str) and val.strip().upper() in {"OK", "COMPRADO", "-", ""}:
         return pd.NaT
     return pd.to_datetime(val, errors="coerce")
 
+def clean_money(val):
+    """Convierte valores como '$ 12.345,67' o 'USD 10.000' a número."""
+    if pd.isna(val):
+        return pd.NA
+    if isinstance(val, (int, float, np.number)):
+        return float(val)
+    s = str(val)
+    s = s.replace("USD", "").replace("$", "").strip()
+    # quitar separador de miles y normalizar decimales
+    s = s.replace(".", "").replace(",", ".")
+    return pd.to_numeric(s, errors="coerce")
+
+def fmt_money(num):
+    if pd.isna(num):
+        return "-"
+    try:
+        return f"${num:,.0f}".replace(",", ".")
+    except Exception:
+        return str(num)
+
+def buscar_hoja(xls, candidatos):
+    """Devuelve el nombre de hoja que contenga alguno de los candidatos."""
+    for s in xls.sheet_names:
+        sl = s.strip().lower()
+        if any(c in sl for c in candidatos):
+            return s
+    return None
+
+def columnas_por_obra(df_plan, obra_nombre):
+    """
+    En la hoja 'Plan de Compras' el patrón es:
+    ... 'Unnamed: 1' (tareas), luego 'CAPRI', 'Unnamed: 3', 'Unnamed: 4', <precio>,
+    luego 'CHALETS', ... etc. Tomamos 3 fechas + 1 precio a partir del header 'obra'.
+    """
+    cols = list(df_plan.columns)
+    if obra_nombre not in cols:
+        raise ValueError(f"No se encontró la columna de inicio para la obra '{obra_nombre}'. "
+                         f"Verificá el encabezado exacto en el Excel.")
+
+    idx = cols.index(obra_nombre)
+    prev_cols = [cols[idx], cols[idx + 1], cols[idx + 2]]           # Fechas OBR, COMPRA, OCE
+    precio_col = cols[idx + 3]                                       # Precio Estimado
+    return prev_cols, precio_col
+
+def preparar_plan_por_obra(df_plan, obra_nombre):
+    # detectar columna de tareas (según tu archivo suele ser 'Unnamed: 1')
+    tareas_col = "Unnamed: 1"
+    if tareas_col not in df_plan.columns:
+        # fallback si cambiaron encabezados
+        for cand in ["Tareas", "Tarea", "tareas", "tarea"]:
+            if cand in df_plan.columns:
+                tareas_col = cand
+                break
+    if tareas_col not in df_plan.columns:
+        raise ValueError("No encuentro la columna de 'Tarea(s)' en la hoja Plan de Compras.")
+
+    prev_cols, precio_col = columnas_por_obra(df_plan, obra_nombre)
+
+    # limpiar fechas previstas
+    fechas_prev = df_plan[prev_cols].applymap(clean_date)
+    fechas_prev.columns = ["Fecha OBR", "Fecha COMPRA", "Fecha OCE"]
+
+    plan = pd.concat([
+        df_plan[tareas_col].rename("Tarea"),
+        fechas_prev,
+        df_plan[precio_col].rename("Precio Estimado")
+    ], axis=1)
+
+    plan = plan.dropna(subset=["Tarea"])
+    plan["Precio Estimado"] = plan["Precio Estimado"].apply(clean_money)
+    plan["Precio Estimado (fmt)"] = plan["Precio Estimado"].apply(fmt_money)
+
+    # mantener filas que tengan al menos 1 fecha prevista
+    plan = plan[plan[["Fecha OBR", "Fecha COMPRA", "Fecha OCE"]].notna().any(axis=1)].reset_index(drop=True)
+    return plan
+
 def calcular_kpis(df_plan, df_real, obra):
-    # Filtramos por obra
+    df_real_obra = df_real[df_real["Obra"].astype(str).str.strip().str.upper() == obra.upper()].copy()
+
+    # Normalizar tipos de fecha en reales
+    for col in ["Real OBR", "Real COMPRA", "Real OCE"]:
+        if col in df_real_obra.columns:
+            df_real_obra[col] = df_real_obra[col].apply(clean_date)
+
     tareas = df_plan["Tarea"].dropna().unique()
-    df_real_obra = df_real[df_real["Obra"] == obra]
+    total_fases = len(tareas) * 3 if len(tareas) else 0
 
-    total_tareas = len(tareas)
     en_fecha = 0
-    total_dias_retraso = []
+    dias_retraso = []
 
-    for _, row in df_real_obra.iterrows():
-        plan_row = df_plan[df_plan["Tarea"] == row["Tarea"]]
-        if not plan_row.empty:
-            for fase in ["OBR", "COMPRA", "OCE"]:
-                fecha_prev = plan_row[f"Fecha {fase}"].values[0]
-                fecha_real = row[f"Real {fase}"]
-                if pd.notna(fecha_prev) and pd.notna(fecha_real):
-                    dias_dif = (fecha_real - fecha_prev).days
-                    if dias_dif <= 0:
-                        en_fecha += 1
-                    else:
-                        total_dias_retraso.append(dias_dif)
+    for _, rr in df_real_obra.iterrows():
+        plan_row = df_plan[df_plan["Tarea"].astype(str).str.strip() == str(rr["Tarea"]).strip()]
+        if plan_row.empty:
+            continue
+        for fase in ["OBR", "COMPRA", "OCE"]:
+            prev = plan_row[f"Fecha {fase}"].values[0]
+            real = rr.get(f"Real {fase}", pd.NaT)
+            if pd.notna(prev) and pd.notna(real):
+                diff = (real - prev).days
+                if diff <= 0:
+                    en_fecha += 1
+                else:
+                    dias_retraso.append(diff)
 
-    pct_en_fecha = (en_fecha / (total_tareas * 3)) * 100 if total_tareas > 0 else 0
-    dias_prom_retraso = sum(total_dias_retraso) / len(total_dias_retraso) if total_dias_retraso else 0
-    total_estimado = df_plan["Precio Estimado"].sum()
+    pct_en_fecha = (en_fecha / total_fases * 100) if total_fases else 0.0
+    prom_retraso = (sum(dias_retraso) / len(dias_retraso)) if dias_retraso else 0.0
+    total_estimado = pd.to_numeric(df_plan["Precio Estimado"], errors="coerce").fillna(0).sum()
 
-    return pct_en_fecha, dias_prom_retraso, total_estimado
+    return pct_en_fecha, prom_retraso, total_estimado
 
 def plot_gantt(df_plan, df_real, obra):
-    df_real_obra = df_real[df_real["Obra"] == obra]
-    gantt_data = []
+    df_real_obra = df_real[df_real["Obra"].astype(str).str.strip().str.upper() == obra.upper()].copy()
+    for c in ["Real OBR", "Real COMPRA", "Real OCE"]:
+        if c in df_real_obra.columns:
+            df_real_obra[c] = df_real_obra[c].apply(clean_date)
 
-    for _, row in df_plan.iterrows():
-        tarea = row["Tarea"]
-        precio = row["Precio Estimado"]
-        real_row = df_real_obra[df_real_obra["Tarea"] == tarea]
+    rows = []
+    for _, pr in df_plan.iterrows():
+        tarea = pr["Tarea"]
+        precio_num = pr["Precio Estimado"]
+        precio_fmt = pr["Precio Estimado (fmt)"]
+        rrow = df_real_obra[df_real_obra["Tarea"].astype(str).str.strip() == str(tarea).strip()]
 
         for fase in ["OBR", "COMPRA", "OCE"]:
-            fecha_prev = row[f"Fecha {fase}"]
-            fecha_real = None
-            if not real_row.empty:
-                fecha_real = real_row[f"Real {fase}"].values[0]
+            prev = pr[f"Fecha {fase}"]
+            real = rrow[f"Real {fase}"].values[0] if (not rrow.empty and f"Real {fase}" in rrow.columns) else pd.NaT
 
-            if pd.notna(fecha_prev):
-                gantt_data.append({
+            if pd.notna(prev):
+                rows.append({
                     "Tarea": tarea,
                     "Fase": f"{fase} (Prevista)",
-                    "Fecha": fecha_prev,
+                    "Fecha": prev,
                     "Tipo": "Prevista",
-                    "Precio Estimado": precio,
+                    "Precio Estimado": precio_num,
+                    "Precio (texto)": precio_fmt,
                     "Diferencia (días)": None
                 })
-            if pd.notna(fecha_real):
-                dias_dif = None
-                color_tipo = "Adelanto/En fecha"
-                if pd.notna(fecha_prev):
-                    dias_dif = (fecha_real - fecha_prev).days
-                    if dias_dif > 0:
-                        color_tipo = "Retraso"
-                gantt_data.append({
+            if pd.notna(real):
+                color = "Adelanto/En fecha"
+                dif = None
+                if pd.notna(prev):
+                    dif = (real - prev).days
+                    if dif > 0:
+                        color = "Retraso"
+                rows.append({
                     "Tarea": tarea,
                     "Fase": f"{fase} (Real)",
-                    "Fecha": fecha_real,
-                    "Tipo": color_tipo,
-                    "Precio Estimado": precio,
-                    "Diferencia (días)": dias_dif
+                    "Fecha": real,
+                    "Tipo": color,
+                    "Precio Estimado": precio_num,
+                    "Precio (texto)": precio_fmt,
+                    "Diferencia (días)": dif
                 })
 
-    gantt_df = pd.DataFrame(gantt_data)
+    if not rows:
+        return px.scatter(title=f"Plan de Compras - {obra} (sin datos para graficar)")
+
+    gantt_df = pd.DataFrame(rows)
 
     fig = px.scatter(
         gantt_df,
@@ -90,72 +179,67 @@ def plot_gantt(df_plan, df_real, obra):
         y="Tarea",
         color="Tipo",
         symbol="Fase",
-        hover_data=["Precio Estimado", "Diferencia (días)"],
-        color_discrete_map={
-            "Prevista": "blue",
-            "Adelanto/En fecha": "green",
-            "Retraso": "red"
-        }
+        hover_data={
+            "Precio (texto)": True,
+            "Diferencia (días)": True,
+            "Fecha": "|%d-%b-%Y",
+            "Precio Estimado": False,   # oculto el num crudo
+        },
+        color_discrete_map={"Prevista": "blue", "Adelanto/En fecha": "green", "Retraso": "red"},
+        height=800,
+        title=f"Plan de Compras - {obra}"
     )
-
-    fig.update_layout(
-        title=f"Plan de Compras - {obra}",
-        xaxis_title="Fecha",
-        yaxis_title="Tarea",
-        legend_title="Tipo",
-        height=800
-    )
+    fig.update_layout(legend_title="Tipo")
     return fig
 
-# ---------------------------------------------
-# Interfaz principal
-# ---------------------------------------------
+# -----------------------------
+# App
+# -----------------------------
 st.set_page_config(page_title="Plan de Compras", layout="wide")
-
 st.sidebar.title("Navegación")
-pagina = st.sidebar.radio("Selecciona la obra", ["CAPRI", "CHALETS", "SENECA"])
+obra_sel = st.sidebar.radio("Selecciona la obra", ["CAPRI", "CHALETS", "SENECA"])
+archivo_excel = st.sidebar.file_uploader("Subí el archivo Excel", type=["xlsx"])
 
-archivo_excel = st.sidebar.file_uploader("Sube el archivo Excel", type=["xlsx"])
+if not archivo_excel:
+    st.warning("📂 Subí un Excel con la hoja de **Plan de Compras** y la hoja **Reales** para comenzar.")
+    st.stop()
 
-if archivo_excel:
-    # Leer datos
-    df_plan = pd.read_excel(archivo_excel, sheet_name="Plan de Compras")
-    df_real = pd.read_excel(archivo_excel, sheet_name="Reales")
+# Leer Excel detectando hojas aunque cambien los nombres
+xls = pd.ExcelFile(archivo_excel)
+plan_sheet = buscar_hoja(xls, ["plan de compras", "plan", "compras"])
+reales_sheet = buscar_hoja(xls, ["reales", "real"])
 
-    # Limpiar fechas en plan
-    for col in df_plan.columns:
-        if "Fecha" in str(col):
-            df_plan[col] = df_plan[col].apply(clean_date)
+if plan_sheet is None:
+    plan_sheet = xls.sheet_names[0]
+if reales_sheet is None:
+    reales_sheet = xls.sheet_names[-1]
 
-    # Limpiar fechas en reales
-    for col in df_real.columns:
-        if "Real" in str(col):
-            df_real[col] = df_real[col].apply(clean_date)
+df_plan_raw = pd.read_excel(xls, sheet_name=plan_sheet)
+df_real = pd.read_excel(xls, sheet_name=reales_sheet)
 
-    # Identificar columnas por obra
-    idx = list(df_plan.columns).index(pagina)
-    prev_cols = [df_plan.columns[idx], df_plan.columns[idx+1], df_plan.columns[idx+2]]
-    precio_col = df_plan.columns[idx+3]
+# limpiar posibles columnas de fecha en plan
+for c in df_plan_raw.columns:
+    if "Fecha" in str(c):
+        df_plan_raw[c] = df_plan_raw[c].apply(clean_date)
 
-    # Crear dataframe formateado
-    fechas_prev = df_plan[prev_cols].applymap(clean_date)
-    fechas_prev.columns = ["Fecha OBR", "Fecha COMPRA", "Fecha OCE"]
-    plan_formateado = pd.concat([
-        df_plan["Unnamed: 1"].rename("Tarea"),
-        fechas_prev,
-        df_plan[precio_col].rename("Precio Estimado")
-    ], axis=1)
-    plan_formateado = plan_formateado.dropna(subset=["Tarea"])
+# preparar plan para la obra elegida
+try:
+    plan_form = preparar_plan_por_obra(df_plan_raw, obra_sel)
+except Exception as e:
+    st.error(f"Problema leyendo el plan para **{obra_sel}**: {e}")
+    st.stop()
 
-    # KPIs
-    pct, prom_dias, total_est = calcular_kpis(plan_formateado, df_real, pagina)
-    col1, col2, col3 = st.columns(3)
-    col1.metric("Cumplimiento en fecha", f"{pct:.1f}%")
-    col2.metric("Días promedio retraso", f"{prom_dias:.1f} días")
-    col3.metric("Total Estimado", f"${total_est:,.0f}")
+# KPIs
+pct_ok, prom_ret, total_est = calcular_kpis(plan_form, df_real, obra_sel)
+c1, c2, c3 = st.columns(3)
+c1.metric("Cumplimiento en fecha", f"{pct_ok:.1f}%")
+c2.metric("Días promedio de retraso", f"{prom_ret:.1f} días")
+c3.metric("Total Estimado", fmt_money(total_est))
 
-    # Gantt
-    fig = plot_gantt(plan_formateado, df_real, pagina)
-    st.plotly_chart(fig, use_container_width=True)
-else:
-    st.warning("📂 Sube un archivo Excel para comenzar.")
+# Gantt
+fig = plot_gantt(plan_form, df_real, obra_sel)
+st.plotly_chart(fig, use_container_width=True)
+
+# Tabla opcional
+with st.expander("Ver tabla base (obra seleccionada)"):
+    st.dataframe(plan_form)
