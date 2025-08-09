@@ -2,11 +2,17 @@ import streamlit as st
 import pandas as pd
 import numpy as np
 import plotly.express as px
-from streamlit_plotly_events import plotly_events  # <-- capturar click en plotly
 
-# -----------------------------
+# --- import opcional para clicks en el gráfico (expand/collapse) ---
+try:
+    from streamlit_plotly_events import plotly_events
+    _HAS_PLOTLY_EVENTS = True
+except Exception:
+    _HAS_PLOTLY_EVENTS = False
+
+# ============================
 # Utilidades
-# -----------------------------
+# ============================
 def clean_date(val):
     if pd.isna(val):
         return pd.NaT
@@ -83,7 +89,6 @@ def preparar_plan_por_obra(df_plan, obra_nombre):
     plan["Tarea"] = plan["Tarea"].astype(str).str.strip()
     plan["Precio Estimado"] = plan["Precio Estimado"].apply(clean_money)
     plan["Precio Estimado (fmt)"] = plan["Precio Estimado"].apply(fmt_money)
-
     plan = plan[plan[["Fecha OBR", "Fecha COMPRA", "Fecha OCE"]].notna().any(axis=1)].reset_index(drop=True)
     return plan
 
@@ -143,10 +148,8 @@ def construir_rows(plan_form, df_real, obra):
 
     rows = []
     for _, pr in plan_form.iterrows():
-        rubro = pr["Rubro"]
-        tarea = pr["Tarea"]
-        precio_num = pr["Precio Estimado"]
-        precio_fmt = pr["Precio Estimado (fmt)"]
+        rubro = pr["Rubro"]; tarea = pr["Tarea"]
+        precio_num = pr["Precio Estimado"]; precio_fmt = pr["Precio Estimado (fmt)"]
         rrow = df_real_obra[df_real_obra["Tarea"].astype(str).str.strip() == str(tarea).strip()]
 
         for fase in ["OBR", "COMPRA", "OCE"]:
@@ -168,14 +171,7 @@ def construir_rows(plan_form, df_real, obra):
                              "Diferencia (días)": dif})
     return pd.DataFrame(rows)
 
-# --- construir dataframe "expandido" inline ---
 def expand_inline(gantt_df, selected_rubro):
-    """
-    Devuelve un df con columna 'Y' ordenada:
-    rubro1, rubro2, [• tarea...] del rubro seleccionado, rubro3...
-    Las tareas del rubro expandido se muestran con sangría.
-    El resto de tareas se suben al nivel del rubro (agrupadas).
-    """
     indent = "  • "
     y_labels = []
     for r in sorted(gantt_df["Rubro"].dropna().unique()):
@@ -184,18 +180,26 @@ def expand_inline(gantt_df, selected_rubro):
             tareas = sorted(gantt_df[gantt_df["Rubro"] == r]["Tarea"].unique())
             y_labels.extend([indent + t for t in tareas])
 
-    # construir columna Y
     def map_y(row):
         if selected_rubro and row["Rubro"] == selected_rubro:
-            return indent + row["Tarea"]  # mostrar desagregado
+            return indent + row["Tarea"]
         else:
-            return row["Rubro"]           # colapsado por rubro
+            return row["Rubro"]
 
     df2 = gantt_df.copy()
     df2["Y"] = df2.apply(map_y, axis=1)
-    # asegurar el orden
     df2["Y"] = pd.Categorical(df2["Y"], categories=y_labels, ordered=True)
     return df2, y_labels
+
+def apply_dark_theme(fig):
+    fig.update_layout(
+        plot_bgcolor="#0e1117",
+        paper_bgcolor="#0e1117",
+        font_color="#e5e5e5",
+        legend_title_font_color="#e5e5e5"
+    )
+    fig.update_xaxes(gridcolor="rgba(255,255,255,0.15)", zerolinecolor="rgba(255,255,255,0.15)")
+    fig.update_yaxes(gridcolor="rgba(255,255,255,0.15)", zerolinecolor="rgba(255,255,255,0.15)")
 
 def make_fig(df_for_plot, title, vista="Mensual", grilla_semanal=True):
     fig = px.scatter(
@@ -205,34 +209,30 @@ def make_fig(df_for_plot, title, vista="Mensual", grilla_semanal=True):
         color="Tipo",
         symbol="Fase",
         hover_data={
-            "Rubro": True,
-            "Tarea": True,
-            "Precio (texto)": True,
-            "Diferencia (días)": True,
+            "Rubro": True, "Tarea": True,
+            "Precio (texto)": True, "Diferencia (días)": True,
             "Fecha": "|%d-%b-%Y",
-            "Y": False, "Precio Estimado": False,
+            "Y": False, "Precio Estimado": False
         },
         color_discrete_map={"Prevista": "blue", "Adelanto/En fecha": "green", "Retraso": "red"},
         height=800,
         title=title
     )
-    fig.update_layout(legend_title="Tipo")
-
     if vista == "Mensual":
         fig.update_xaxes(ticklabelmode="period", dtick="M1", tickformat="%b %Y", showgrid=False)
         add_month_grid(fig, df_for_plot["Fecha"], add_week_subdiv=grilla_semanal)
     else:
-        fig.update_xaxes(tickformat="%d-%b\n%Y", dtick=7 * 24 * 60 * 60 * 1000,
-                         showgrid=True, gridcolor="rgba(255,255,255,0.15)")
+        fig.update_xaxes(tickformat="%d-%b\n%Y", dtick=7*24*60*60*1000, showgrid=True,
+                         gridcolor="rgba(255,255,255,0.15)")
+    apply_dark_theme(fig)
     return fig
 
-# -----------------------------
+# ============================
 # App
-# -----------------------------
+# ============================
 st.set_page_config(page_title="Plan de Compras", layout="wide")
 st.sidebar.title("Navegación")
 obra_sel = st.sidebar.radio("Selecciona la obra", ["CAPRI", "CHALETS", "SENECA"])
-
 vista_sel = st.sidebar.selectbox("Escala de tiempo", ["Mensual", "Semanal"])
 grilla_week = st.sidebar.checkbox("Dividir cada mes en 4 'semanas' (1/8/15/22)", value=True)
 
@@ -265,42 +265,38 @@ c1.metric("Cumplimiento en fecha", f"{pct_ok:.1f}%")
 c2.metric("Días promedio de retraso", f"{prom_ret:.1f} días")
 c3.metric("Total Estimado", fmt_money(total_est))
 
-# Datos base (Prevista vs Real) por rubro/tarea
+# Datos de puntos (Prev/Real)
 gantt_all = construir_rows(plan_form, df_real, obra_sel)
 
-# --- Estado de expansión (guardado en sesión) ---
+# Estado de expansión
 if "rubro_expandido" not in st.session_state:
     st.session_state.rubro_expandido = None
 
-# DF con y colapsado por rubro o expandido si hay rubro seleccionado
-df_plot, y_order = expand_inline(gantt_all, st.session_state.rubro_expandido)
+# DF para graficar (colapsado/expandido)
+df_plot, _ = expand_inline(gantt_all, st.session_state.rubro_expandido)
 
-# Gráfico
+# Figura
 fig = make_fig(df_plot, f"Plan de Compras - {obra_sel}", vista=vista_sel, grilla_semanal=grilla_week)
 
-# Mostrar y capturar click
-events = plotly_events(fig, click_event=True, hover_event=False, select_event=False, override_height=800, override_width="100%")
+# Eventos de click para expandir/colapsar
+if _HAS_PLOTLY_EVENTS:
+    events = plotly_events(fig, click_event=True, hover_event=False, select_event=False,
+                           override_height=800, override_width="100%")
+else:
+    st.info("Para expandir por rubro instala 'streamlit-plotly-events' y reinicia la app.")
+    events = []
 
-# Si clickean, detectar el rubro del punto para expandir/colapsar
 if events:
-    # el y que recibimos puede ser 'Rubro' o '  • Tarea'
-    y_clicked = events[0].get("y")
-    if y_clicked:
-        y_clicked = str(y_clicked)
-        # si clic en tarea (indentada), tomamos su rubro
-        if y_clicked.startswith("  • "):
-            tarea_name = y_clicked.replace("  • ", "", 1)
-            rubro = gantt_all[gantt_all["Tarea"] == tarea_name]["Rubro"].iloc[0] if not gantt_all[gantt_all["Tarea"] == tarea_name].empty else None
-        else:
-            rubro = y_clicked
+    y_clicked = str(events[0].get("y", ""))
+    if y_clicked.startswith("  • "):
+        tarea = y_clicked.replace("  • ", "", 1)
+        match = gantt_all[gantt_all["Tarea"] == tarea]
+        rubro = match["Rubro"].iloc[0] if not match.empty else None
+    else:
+        rubro = y_clicked
 
-        # toggle expand/collapse
-        if st.session_state.rubro_expandido == rubro:
-            st.session_state.rubro_expandido = None
-        else:
-            st.session_state.rubro_expandido = rubro
-
-        # forzar rerun para aplicar cambio
+    if rubro:
+        st.session_state.rubro_expandido = None if st.session_state.rubro_expandido == rubro else rubro
         st.experimental_rerun()
 
 # Botón para colapsar
@@ -310,6 +306,6 @@ if st.session_state.rubro_expandido:
         st.session_state.rubro_expandido = None
         st.experimental_rerun()
 
-# Tabla
+# Tabla base
 with st.expander("Ver tabla base (obra seleccionada)"):
     st.dataframe(plan_form)
