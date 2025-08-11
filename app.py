@@ -3,7 +3,7 @@ import pandas as pd
 import numpy as np
 import plotly.express as px
 
-# --- import opcional para clicks en el gráfico (expand/collapse) ---
+# Clicks sobre el gráfico (manejo robusto si no está instalada la lib aún)
 try:
     from streamlit_plotly_events import plotly_events
     _HAS_PLOTLY_EVENTS = True
@@ -172,6 +172,7 @@ def construir_rows(plan_form, df_real, obra):
     return pd.DataFrame(rows)
 
 def expand_inline(gantt_df, selected_rubro):
+    """Genera columna Y: solo Rubro; si está expandido agrega '  • tarea' debajo."""
     indent = "  • "
     y_labels = []
     for r in sorted(gantt_df["Rubro"].dropna().unique()):
@@ -202,6 +203,9 @@ def apply_dark_theme(fig):
     fig.update_yaxes(gridcolor="rgba(255,255,255,0.15)", zerolinecolor="rgba(255,255,255,0.15)")
 
 def make_fig(df_for_plot, title, vista="Mensual", grilla_semanal=True):
+    import plotly.graph_objects as go
+
+    # Capa principal: puntos
     fig = px.scatter(
         df_for_plot,
         x="Fecha",
@@ -218,13 +222,33 @@ def make_fig(df_for_plot, title, vista="Mensual", grilla_semanal=True):
         height=800,
         title=title
     )
+
+    # Eje X
     if vista == "Mensual":
         fig.update_xaxes(ticklabelmode="period", dtick="M1", tickformat="%b %Y", showgrid=False)
         add_month_grid(fig, df_for_plot["Fecha"], add_week_subdiv=grilla_semanal)
     else:
-        fig.update_xaxes(tickformat="%d-%b\n%Y", dtick=7*24*60*60*1000, showgrid=True,
-                         gridcolor="rgba(255,255,255,0.15)")
+        fig.update_xaxes(tickformat="%d-%b\n%Y", dtick=7*24*60*60*1000,
+                         showgrid=True, gridcolor="rgba(255,255,255,0.15)")
+
+    # Tema oscuro
     apply_dark_theme(fig)
+
+    # Targets invisibles por rubro (para poder clickear la fila del rubro)
+    if not df_for_plot["Fecha"].dropna().empty:
+        y_vals = [c for c in df_for_plot["Y"].cat.categories if not str(c).startswith("  • ")]
+        if y_vals:
+            mid_x = df_for_plot["Fecha"].min() + (df_for_plot["Fecha"].max() - df_for_plot["Fecha"].min())/2
+            fig.add_trace(go.Scatter(
+                x=[mid_x]*len(y_vals),
+                y=y_vals,
+                mode="markers",
+                marker=dict(size=20, opacity=0),
+                hoverinfo="skip",
+                showlegend=False,
+                name="click-target"
+            ))
+
     return fig
 
 # ============================
@@ -241,10 +265,10 @@ if not archivo_excel:
     st.warning("📂 Subí un Excel con la hoja de **Plan de Compras** y la hoja **Reales** para comenzar.")
     st.stop()
 
+# Leer Excel
 xls = pd.ExcelFile(archivo_excel)
 plan_sheet = buscar_hoja(xls, ["plan de compras", "plan", "compras"]) or xls.sheet_names[0]
 reales_sheet = buscar_hoja(xls, ["reales", "real"]) or xls.sheet_names[-1]
-
 df_plan_raw = pd.read_excel(xls, sheet_name=plan_sheet)
 df_real = pd.read_excel(xls, sheet_name=reales_sheet)
 
@@ -272,7 +296,7 @@ gantt_all = construir_rows(plan_form, df_real, obra_sel)
 if "rubro_expandido" not in st.session_state:
     st.session_state.rubro_expandido = None
 
-# DF para graficar (colapsado/expandido)
+# DF para graficar
 df_plot, _ = expand_inline(gantt_all, st.session_state.rubro_expandido)
 
 # Figura
